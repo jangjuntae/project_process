@@ -3,100 +3,206 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <mutex>
-#include <map>
+#include <chrono>
+#include <atomic>
 #include <functional>
-#include <algorithm>
 
 using namespace std;
 
 mutex cout_mutex;
+mutex vector_mutex;
 
-void echo(const string& text) {
-    lock_guard<mutex> lock(cout_mutex);
-    cout << text << endl;
-}
+string prompt = "prompt> ";
 
 int gcd(int a, int b) {
     while (b != 0) {
-        int t = b;
+        int temp = b;
         b = a % b;
-        a = t;
+        a = temp;
     }
     return a;
 }
 
-int count_primes(int limit) {
-    vector<bool> is_prime(limit + 1, true);
+int count_primes(int n) {
+    vector<bool> prime(n + 1, true);
     int count = 0;
-
-    for (int i = 2; i <= limit; ++i) {
-        if (is_prime[i]) {
-            ++count;
-            for (int j = 2 * i; j <= limit; j += i) {
-                is_prime[j] = false;
+    for (int p = 2; p * p <= n; p++) {
+        if (prime[p]) {
+            for (int i = p * p; i <= n; i += p) {
+                prime[i] = false;
             }
         }
+    }
+    for (int p = 2; p <= n; p++) {
+        if (prime[p]) count++;
     }
     return count;
 }
 
-long long sum_up_to(int limit) {
+long long sum_partial(int start, int end) {
     long long sum = 0;
-    for (int i = 1; i <= limit; ++i) {
+    for (int i = start; i <= end; i++) {
         sum += i;
+        sum %= 1000000;
     }
-    return sum % 1000000;
+    return sum;
 }
 
-void execute_command(const string& command) {
-    istringstream iss(command);
-    string cmd;
-    iss >> cmd;
+void execute_sum(int n, int m) {
+    vector<thread> workers;
+    vector<long long> partial_sums(m, 0);
+    int chunk_size = n / m;
+    int remaining = n % m;
 
-    if (cmd == "echo") {
-        string text;
-        getline(iss, text);
-        echo(text.substr(1)); // remove leading space
+    for (int i = 0; i < m; i++) {
+        int start = i * chunk_size + 1;
+        int end = (i + 1) * chunk_size + (i == m - 1 ? remaining : 0);
+
+        workers.emplace_back([=, &partial_sums]() {
+            long long sum = sum_partial(start, end);
+            partial_sums[i] = sum;  // 스레드에서 계산한 부분합을 저장
+            });
     }
-    else if (cmd == "gcd") {
-        int x, y;
-        iss >> x >> y;
-        lock_guard<mutex> lock(cout_mutex);
-        cout << "GCD of " << x << " and " << y << " is " << gcd(x, y) << endl;
+
+    for (auto& worker : workers) {
+        worker.join();  // 모든 스레드가 종료될 때까지 대기
     }
-    else if (cmd == "prime") {
-        int x;
-        iss >> x;
-        lock_guard<mutex> lock(cout_mutex);
-        cout << "Count of primes up to " << x << " is " << count_primes(x) << endl;
+
+    long long final_sum = 0;
+    for (auto value : partial_sums) {
+        final_sum += value;
+        final_sum %= 1000000;  // 최종 합산을 모듈로 연산
     }
-    else if (cmd == "sum") {
-        int x;
-        iss >> x;
-        lock_guard<mutex> lock(cout_mutex);
-        cout << "Sum of numbers up to " << x << " mod 1000000 is " << sum_up_to(x) << endl;
+
+    // 최종 결과를 한 번만 출력
+    cout << "Sum of numbers up to " << n << " mod 1000000 is " << final_sum << endl;
+}
+
+void execute_command(string cmd, int repeat_period, int duration, int instance_count, int m, bool isBackground) {
+    vector<thread> threads;
+    auto start_time = chrono::steady_clock::now();
+
+    for (int i = 0; i < instance_count; ++i) {
+        threads.emplace_back([=]() {
+            try {
+                while (chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start_time).count() < duration) {
+                    {
+                        lock_guard<mutex> lock(cout_mutex);
+                        if (cmd.find("gcd") == 0) {
+                            stringstream ss(cmd);
+                            string tmp; int x, y;
+                            ss >> tmp >> x >> y;
+                            cout << "GCD of " << x << " and " << y << " is " << gcd(x, y) << endl;
+                        }
+                        else if (cmd.find("prime") == 0) {
+                            stringstream ss(cmd);
+                            string tmp; int x;
+                            ss >> tmp >> x;
+                            cout << "Count of primes up to " << x << " is " << count_primes(x) << endl;
+                        }
+                        else if (cmd.find("sum") == 0) {
+                            stringstream ss(cmd);
+                            string tmp; int x;
+                            ss >> tmp >> x;
+                            if (m > 0) {
+                                execute_sum(x, m);
+                            }
+                            else {
+                                cout << "Sum of numbers up to " << x << " mod 1000000 is " << sum_partial(1, x) << endl;
+                            }
+                        }
+                        else if (cmd.find("echo") == 0) {
+                            cout << cmd.substr(5) << endl;
+                        }
+                    }
+                    this_thread::sleep_for(chrono::seconds(repeat_period));
+                    if (repeat_period == 0) break;
+                }
+            }
+            catch (const std::exception& e) {
+                lock_guard<mutex> lock(cout_mutex);
+                cout << "Exception caught in thread: " << e.what() << endl;
+            }
+            });
+    }
+
+    if (!isBackground) {
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+    else {
+        for (auto& thread : threads) {
+            thread.detach();
+        }
     }
 }
 
-void process_commands(const string& filename) {
+
+void process_command(const string& line) {
+    bool isBackground = line[0] == '&';
+    string cleanLine = isBackground ? line.substr(1) : line;
+
+    istringstream iss(cleanLine);
+    string token;
+    vector<string> tokens;
+
+    while (iss >> token) {
+        tokens.push_back(token);
+    }
+
+    if (tokens.empty()) return;
+
+    string cmd = tokens[0];
+    int n = 1, d = 300, p = 0, m = 0;
+
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        if (tokens[i] == "-n" && i + 1 < tokens.size()) {
+            n = stoi(tokens[i + 1]);
+            i++;
+        }
+        else if (tokens[i] == "-d" && i + 1 < tokens.size()) {
+            d = stoi(tokens[i + 1]);
+            i++;
+        }
+        else if (tokens[i] == "-p" && i + 1 < tokens.size()) {
+            p = stoi(tokens[i + 1]);
+            i++;
+        }
+        else if (tokens[i] == "-m" && i + 1 < tokens.size()) {
+            m = stoi(tokens[i + 1]);
+            i++;
+        }
+        else {
+            cmd += " " + tokens[i];
+        }
+    }
+
+    execute_command(cmd, p, d, n, m, isBackground);
+}
+
+void shell_thread_function(const string& filename) {
     ifstream file(filename);
     string line;
-    vector<thread> threads;
 
-    while (getline(file, line)) {
-        threads.push_back(thread(execute_command, line));
-        this_thread::sleep_for(chrono::seconds(5)); // simulate the time interval
+    if (!file.is_open()) {
+        lock_guard<mutex> lock(cout_mutex);
+        cout << "Failed to open " << filename << endl;
+        return;
     }
 
-    // Wait for all threads to complete
-    for (auto& th : threads) {
-        th.join();
+    while (getline(file, line)) {
+        cout << prompt << line << endl;
+        process_command(line);
     }
 }
 
 int main() {
-    string filename = "commands.txt";
-    process_commands(filename);
+    thread shell(shell_thread_function, "commands.txt");
+    shell.join();
     return 0;
 }
